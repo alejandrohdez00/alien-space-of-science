@@ -4,7 +4,9 @@ Code and released artifacts for **"The Alien Space of Science: Sampling Coherent
 
 The paper studies a simple question: can we generate research directions that are internally coherent, but unlikely to be proposed by existing scientific communities? We represent papers as reusable **idea atoms**, learn which atom combinations are coherent, learn which combinations are already close to author communities, and sample the region that is coherent but cognitively unavailable to existing scientific communities.
 
-**Figure 1:** [Alien Space of Science pipeline](figures/figure1.pdf)
+<p align="center">
+  <img src="figures/figure1_page-0001.jpg" alt="Alien Space of Science pipeline" width="95%">
+</p>
 
 ## What This Repository Does
 
