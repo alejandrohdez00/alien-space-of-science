@@ -1,0 +1,12 @@
+aiohttp
+backoff
+litellm
+numpy>=1.23.0
+pypdf
+scikit-learn>=1.0.0
+sentence-transformers
+torch>=2.0.0
+umap-learn>=0.5.0
+igraph
+leidenalg
+wandb>=0.15.0

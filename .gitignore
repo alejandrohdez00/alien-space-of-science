@@ -1,0 +1,28 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local pipeline outputs
+papers/
+data/*
+!data/
+!data/README.md
+clusters.json
+*.npy
+/datasets/
+models/*
+!models/
+!models/README.md
+results/
+reconstructions/
+experiments/
+logs/
+
+# Local secrets and notebooks
+.env
+*.ipynb_checkpoints/
