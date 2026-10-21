@@ -1,6 +1,6 @@
 # The Alien Space of Science
 
-Code and data for **The Alien Space of Science: Sampling Coherent but Cognitively Unavailable Research Directions**.
+Code and data for **[The Alien Space of Science: Sampling Coherent but Cognitively Unavailable Research Directions](https://arxiv.org/abs/2603.01092)**.
 
 Alien represents papers as idea atoms and ranks combinations using a coherence transformer and an author–atom dual encoder. An LLM can then turn selected combinations into research proposals.
 
