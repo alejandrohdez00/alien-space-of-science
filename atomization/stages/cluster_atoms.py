@@ -667,7 +667,7 @@ def run_clustering():
     parser.add_argument("--min-cluster-size", type=int, default=30,
                         help="Minimum atoms required to form a cluster (default: 30)")
     parser.add_argument("--min-samples", type=int, default=5,
-                        help="HDBSCAN min_samples parameter (default: 10)")
+                        help="HDBSCAN min_samples parameter (default: 5)")
     parser.add_argument("--samples-per-cluster", type=int, default=100,
                         help="Number of atoms to sample for naming each cluster (default: 100)")
     parser.add_argument("--embeddings-path", type=str, default=None,

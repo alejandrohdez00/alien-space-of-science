@@ -124,6 +124,10 @@ def load_author_embeddings(
     )
     with open(model_path / "author_id_to_index.json", "r", encoding="utf-8") as f:
         id_to_idx = json.load(f)
+    if embeds.ndim != 2 or len(id_to_idx) != embeds.shape[0]:
+        raise ValueError("Author embeddings and author ID mapping have different row counts")
+    if sorted(id_to_idx.values()) != list(range(len(id_to_idx))):
+        raise ValueError("Author ID mapping must index each embedding row exactly once")
     author_ids = sorted(id_to_idx.keys(), key=lambda k: id_to_idx[k])
     return embeds, author_ids
 
@@ -140,6 +144,9 @@ def score_sequences_two_tower(
     """Score atom sets by their top-k median author compatibility."""
     if not all_token_ids:
         return []
+
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
 
     bos = token_mapping.bos_token_id
     eos = token_mapping.eos_token_id

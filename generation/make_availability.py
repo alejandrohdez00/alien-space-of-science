@@ -1,276 +1,214 @@
-"""Generate the availability dataset for two-tower training.
-
-Produces one row per (author, subset) pair. Each row carries:
-  - query_ids:  the positive atom subset the query tower sees
-  - author_ids: the author's complement pool (pool - subset) the author tower sees
-
-Pool handling is deterministic: enumerate small pools and sample large pools
-with length weighted by C(n, L). Dedup is per-author only; two authors sharing
-a subset are kept because their complements differ.
-
-Usage:
-    python alien.py make-availability \
-        --clusters clusters.json \
-        --vocab data/vocab.json \
-        --db data/llm-papers.db \
-        --token-mapping datasets/coherence/token_mapping.json \
-        --min-length 2 --max-length 4 \
-        --split 0.9 \
-        --output-dir datasets/availability
-"""
-
+"""Stream the original sampling policy into compact records and JSONL exports."""
 import argparse
+import array
+import hashlib
+import itertools
 import json
+import math
 import random
+import shutil
+import sqlite3
+import time
+from collections import defaultdict
 from pathlib import Path
 
-from generation.datasets.availability import (
-    build_atoms_sidecar,
-    generate_availability_dataset,
-    save_availability_dataset,
-)
-from generation.datasets.token_mapping import (
-    create_cluster_to_token_mapping,
-    load_token_mapping,
-    save_token_mapping,
-)
+import numpy as np
+
+from generation.availability_data import ROW, Corpus
 
 
-def _write_jsonl(rows: list[dict], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(8 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
 
 
-def _split_samples(
-    samples: list[dict],
-    split_ratio: float,
-    seed: int,
-) -> tuple[list[dict], list[dict]]:
+def profiles_from_sources(clusters, database, mapping):
+    paper_atoms = defaultdict(set)
+    for row in json.loads(Path(clusters).read_text())['atom_assignments']:
+        if row['cluster'] != -1:
+            paper_atoms[row['paper_id']].add(row['cluster'])
+    conn = sqlite3.connect('file:' + str(Path(database).resolve()) + '?mode=ro', uri=True)
+    authors = dict(conn.execute('SELECT author_id, display_name FROM authors'))
+    paper_authors = defaultdict(list)
+    for pid, aid in conn.execute('SELECT paper_id, author_id FROM paper_authors'):
+        paper_authors[pid].append(aid)
+    conn.close()
+    aliases = {p.replace('/', '__'): p for p in paper_authors}
+    result = {}
+    for pid, atoms in paper_atoms.items():
+        canonical = pid if pid in paper_authors else aliases.get(pid)
+        if canonical is None:
+            raise ValueError(f'Unresolved clustered paper: {pid}')
+        for aid in paper_authors[canonical]:
+            item = result.setdefault(aid, dict(atoms=set(), paper_count=0, display_name=authors[aid]))
+            item['atoms'].update(atoms)
+            item['paper_count'] += 1
+    c2t = {int(k): int(v) for k, v in mapping['cluster_to_token_id'].items()}
+    for item in result.values():
+        item['atoms'] = sorted(item['atoms'])
+        item['tokens'] = [c2t[a] for a in item['atoms']]
+    return result, len(paper_atoms)
+
+
+def samples(profiles, mapping, seed=42, cap=30, budget=20000, min_length=2, max_length=4):
+    """Same RNG calls/order as the original generators, without retaining rows."""
     rng = random.Random(seed)
-    shuffled = samples.copy()
-    rng.shuffle(shuffled)
-    cut = int(len(shuffled) * split_ratio)
-    return shuffled[:cut], shuffled[cut:]
+    c2t = {int(k): int(v) for k, v in mapping['cluster_to_token_id'].items()}
+    for ai, aid in enumerate(sorted(profiles)):
+        pool = profiles[aid]['atoms']
+        pool_set = set(pool)
+        if len(pool) < 2:
+            continue
+        lengths = list(range(min_length, min(max_length, len(pool)) + 1))
+        if not lengths:
+            continue
+        seen = set()
+        emitted, attempts = 0, 0
+        per_length = defaultdict(int)
+        if len(pool) <= cap:
+            candidates = itertools.chain.from_iterable(itertools.combinations(pool, k) for k in lengths)
+        else:
+            weights = [math.comb(len(pool), k) for k in lengths]
+            def draw():
+                while attempts < budget * 8 and emitted < budget:
+                    k = rng.choices(lengths, weights=weights, k=1)[0]
+                    yield tuple(sorted(rng.sample(pool, k)))
+            candidates = draw()
+        for subset in candidates:
+            if len(pool) > cap:
+                attempts += 1
+            # Encode a sorted set into a unique compact integer for dedup.
+            key = len(subset)
+            for atom in subset:
+                key = (key << 16) | atom
+            if len(pool) > cap:
+                if key in seen:
+                    continue
+                seen.add(key)
+            query = list(subset)
+            rng.shuffle(query)
+            complement = sorted(pool_set.difference(subset))
+            rng.shuffle(complement)
+            k = len(query)
+            yield ai, [c2t[a] for a in query], [c2t[a] for a in complement], per_length[k]
+            per_length[k] += 1
+            emitted += 1
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate the two-tower availability dataset"
-    )
-
-    parser.add_argument(
-        "--clusters",
-        type=str,
-        required=True,
-        help="Path to clusters.json",
-    )
-    parser.add_argument(
-        "--vocab",
-        type=str,
-        default="vocab.json",
-        help="Path to vocab.json (default: vocab.json)",
-    )
-    parser.add_argument(
-        "--db",
-        type=str,
-        default="data/llm-papers.db",
-        help="Path to SQLite database (default: data/llm-papers.db)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="datasets/availability",
-        help="Output directory",
-    )
-    parser.add_argument(
-        "--token-mapping",
-        type=str,
-        default=None,
-        help="Existing token_mapping.json to reuse",
-    )
-
-    parser.add_argument(
-        "--pool-cap",
-        type=int,
-        default=30,
-        help="Authors with pool <= cap are fully enumerated (default: 30)",
-    )
-    parser.add_argument(
-        "--per-author-budget",
-        type=int,
-        default=20000,
-        help="Per-author sample budget for pools above the cap (default: 20000)",
-    )
-    parser.add_argument(
-        "--min-length",
-        type=int,
-        default=2,
-        help="Minimum subset length (default: 2)",
-    )
-    parser.add_argument(
-        "--max-length",
-        type=int,
-        default=4,
-        help="Maximum subset length (default: 4)",
-    )
-    parser.add_argument(
-        "--min-atoms",
-        type=int,
-        default=2,
-        help="Minimum super-atoms required to include an author (default: 2)",
-    )
-    parser.add_argument(
-        "--max-venue-year",
-        type=int,
-        default=None,
-        help="Inclusive temporal cutoff on papers.venue_year (default: no cutoff)",
-    )
-
-    parser.add_argument(
-        "--split",
-        type=float,
-        default=None,
-        help=(
-            "Train/val split ratio, e.g. 0.9. If unset, writes one "
-            "availability.jsonl file."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
-    parser.add_argument(
-        "--include-debug-tokens",
-        action="store_true",
-        help="Include tokens_debug fields for query and author sides",
-    )
-    parser.add_argument(
-        "--no-atoms-sidecar",
-        action="store_true",
-        help="Skip writing availability_atoms.json",
-    )
-
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\n{'='*60}")
-    print("Availability Dataset (two-tower)")
-    print(f"{'='*60}")
-    print(f"Clusters: {args.clusters}")
-    print(f"Database: {args.db}")
-    print(f"Output:   {args.output_dir}")
-    print(f"Pool cap: {args.pool_cap}   Per-author budget: {args.per_author_budget}")
-    print(f"Lengths:  {args.min_length}..{args.max_length}   min_atoms={args.min_atoms}")
-    if args.max_venue_year:
-        print(f"Temporal cutoff: <= {args.max_venue_year}")
-    if args.split:
-        print(
-            f"Split:    {args.split:.2f} train / {1 - args.split:.2f} val "
-            "(random sample-level)"
-        )
-    else:
-        print("Split:    none (single availability.jsonl)")
-    print(f"{'='*60}\n")
-
-    with open(args.clusters, "r", encoding="utf-8") as f:
-        clusters_data = json.load(f)
-
-    if args.token_mapping:
-        print(f"Loading existing token mapping from {args.token_mapping}...")
-        token_mapping = load_token_mapping(args.token_mapping)
-        print(f"  Loaded mapping for {token_mapping['n_clusters']} clusters")
-        mapping_path = output_dir / "token_mapping.json"
-        if not mapping_path.exists():
-            save_token_mapping(token_mapping, str(mapping_path))
-            print(f"  Copied to {mapping_path}")
-    else:
-        print("Creating token mapping...")
-        token_mapping = create_cluster_to_token_mapping(clusters_data, args.vocab)
-        mapping_path = output_dir / "token_mapping.json"
-        save_token_mapping(token_mapping, str(mapping_path))
-        print(f"  Created mapping for {token_mapping['n_clusters']} clusters")
-        print(f"  Saved to {mapping_path}")
-
-    print("\nGenerating samples (this may take several minutes)...")
-    dataset = generate_availability_dataset(
-        clusters_path=args.clusters,
-        db_path=args.db,
-        token_mapping=token_mapping,
-        pool_cap=args.pool_cap,
-        per_author_budget=args.per_author_budget,
-        min_length=args.min_length,
-        max_length=args.max_length,
-        min_atoms=args.min_atoms,
-        max_venue_year=args.max_venue_year,
-        include_debug_tokens=args.include_debug_tokens,
-        random_seed=args.seed,
-    )
-
-    meta = dataset["metadata"]
-
-    if args.split is not None:
-        train, val = _split_samples(dataset["samples"], args.split, args.seed)
-        train_path = output_dir / "availability_train.jsonl"
-        val_path = output_dir / "availability_val.jsonl"
-        _write_jsonl(train, train_path)
-        _write_jsonl(val, val_path)
-        meta["split_ratio"] = args.split
-        meta["train_samples_count"] = len(train)
-        meta["val_samples_count"] = len(val)
-    else:
-        availability_path = output_dir / "availability.jsonl"
-        save_availability_dataset(dataset, str(availability_path))
-
-    if not args.no_atoms_sidecar:
-        atoms_sidecar = build_atoms_sidecar(clusters_data)
-        atoms_path = output_dir / "availability_atoms.json"
-        with open(atoms_path, "w", encoding="utf-8") as f:
-            json.dump(atoms_sidecar, f, indent=2)
-
-    metadata_path = output_dir / "metadata.json"
-    combined_metadata = {
-        "clusters_path": args.clusters,
-        "vocab_path": args.vocab,
-        "db_path": args.db,
-        "seed": args.seed,
-        "availability": meta,
-    }
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(combined_metadata, f, indent=2)
-
-    comp = meta["complement_size_stats"]
-
-    print(f"\n{'='*60}")
-    print("Results")
-    print(f"{'='*60}")
-    print(f"  Total samples:       {meta['total_samples']}")
-    print(f"  Duplicates rejected: {meta['duplicates_rejected']} (per-author only)")
-    print(
-        f"  Authors included:    {meta['authors_included']} "
-        f"(enumerated: {meta['authors_enumerated']}, "
-        f"sampled: {meta['authors_sampled']})"
-    )
-    print(
-        f"  Authors skipped:     {meta['authors_skipped']} "
-        f"(< min_atoms: {meta['authors_skipped_atoms']})"
-    )
-    print(f"  Avg atoms/author:    {meta['avg_atoms_per_author']}")
-    print(f"  Avg papers/author:   {meta['avg_papers_per_author']}")
-    print(f"  Samples by length:   {meta['samples_by_length']}")
-    print(f"  Authors by length:   {meta['authors_by_length']}")
-    print(f"  Complement size:     min={comp['min']} max={comp['max']} avg={comp['avg']}")
-    if args.split is not None:
-        print(f"  Train samples:       {meta['train_samples_count']}")
-        print(f"  Val samples:         {meta['val_samples_count']}")
-        print(f"  Train path:          {output_dir / 'availability_train.jsonl'}")
-        print(f"  Val path:            {output_dir / 'availability_val.jsonl'}")
-    else:
-        print(f"  Output path:         {output_dir / 'availability.jsonl'}")
-    print(f"  Metadata:            {metadata_path}")
-    print(f"  Token mapping:       {mapping_path}")
-    print(f"{'='*60}\n")
+def build(args):
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    if (out / 'metadata.json').exists():
+        raise FileExistsError(f'Completed dataset already exists: {out}')
+    mapping = json.loads(Path(args.token_mapping).read_text())
+    assert sorted(mapping['cluster_to_token_id'].values()) == list(range(mapping['n_clusters']))
+    profiles, papers = profiles_from_sources(args.clusters, args.db, mapping)
+    counts = dict(mapped_papers=papers, authors_with_atoms=len(profiles),
+                  authors_min2=sum(len(p['atoms']) >= 2 for p in profiles.values()),
+                  authors_min3=sum(len(p['atoms']) >= 3 for p in profiles.values()))
+    print(counts, flush=True)
+    shutil.copyfile(args.token_mapping, out / 'token_mapping.json')
+    (out / 'profiles.json').write_text(json.dumps(profiles))
+    (out / 'author_ids.json').write_text(json.dumps(sorted(profiles)))
+    offset = n = 0
+    started = time.monotonic()
+    buffer = []
+    complement_buffer = array.array('H')
+    with (out / 'rows.bin').open('wb') as rows_f, (out / 'complements.bin').open('wb') as comp_f:
+        for ai, q, comp, si in samples(profiles, mapping, args.seed, args.pool_cap, args.per_author_budget, args.min_length, args.max_length):
+            buffer.append((ai, q + [mapping['n_clusters']] * (4 - len(q)), len(q), offset, len(comp), si))
+            complement_buffer.extend(comp)
+            offset += len(comp)
+            n += 1
+            if len(buffer) == 100000:
+                np.asarray(buffer, dtype=ROW).tofile(rows_f)
+                complement_buffer.tofile(comp_f)
+                buffer.clear(); complement_buffer = array.array('H')
+                if n % 1000000 == 0:
+                    elapsed = time.monotonic() - started
+                    print(f'Generated {n:,} records in {elapsed:.1f}s '
+                          f'({n / elapsed:,.0f} records/s)', flush=True)
+        np.asarray(buffer, dtype=ROW).tofile(rows_f)
+        complement_buffer.tofile(comp_f)
+    if n == 0:
+        raise ValueError('No eligible author subsets found in the supplied corpus')
+    rows = np.memmap(out / 'rows.bin', mode='r', dtype=ROW)
+    # Reproduce the original random.Random(42).shuffle sample-level split.
+    order = np.arange(n, dtype=np.int64)
+    print(f'Generation complete; shuffling {n:,} records', flush=True)
+    random.Random(args.seed).shuffle(order)
+    cut = int(n * args.split)
+    raw_train, raw_val = order[:cut], order[cut:]
+    for split, indices in [('train', raw_train), ('val', raw_val)]:
+        np.save(out / f'{split}_all.npy', indices)
+        usable = indices[rows['count'][indices] > 0]
+        np.save(out / f'{split}.npy', usable)
+        counts[f'{split}_records'] = len(indices)
+        counts[f'{split}_usable'] = len(usable)
+        if split == 'train':
+            np.save(out / 'training_authors.npy', np.unique(rows['author'][usable]))
+            freq = np.zeros(mapping['n_clusters'], dtype=np.int64)
+            for start in range(0, len(usable), 100000):
+                q = rows['query'][usable[start:start + 100000]].ravel()
+                freq += np.bincount(q[q < len(freq)], minlength=len(freq))
+            np.save(out / 'atom_counts.npy', freq)
+    metadata = dict(kind='two_tower', schema='subset_complement_v1',
+                    seed=args.seed, split=args.split, pool_cap=args.pool_cap,
+                    per_author_budget=args.per_author_budget, min_length=args.min_length,
+                    max_length=args.max_length, min_atoms=2, counts=counts, total_records=n,
+                    inputs={k: {'path': str(getattr(args, k)), 'sha256': sha256(getattr(args, k))}
+                            for k in ['clusters', 'db', 'token_mapping']})
+    (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
+    print(json.dumps(metadata, indent=2), flush=True)
+    if args.export_jsonl:
+        export(out)
+    (out / 'READY').write_text('complete\n')
 
 
-if __name__ == "__main__":
+def export(directory):
+    corpus = Corpus(directory)
+    for split in ['train', 'val']:
+        order = np.load(corpus.path / f'{split}_all.npy', mmap_mode='r')
+        prefix = 'contrastive_availability'
+        with (corpus.path / f'{prefix}_{split}.jsonl').open('w') as f:
+            started = time.monotonic()
+            for position, idx in enumerate(order, 1):
+                r = corpus.rows[idx]; aid = corpus.author_ids[int(r['author'])]
+                q = r['query'][:int(r['length'])].tolist()
+                row = dict(author_id=aid, display_name=corpus.profiles[aid]['display_name'],
+                           seq_len=len(q), sample_idx=int(r['sample']))
+                start, count = int(r['offset']), int(r['count'])
+                row.update(query_ids=q, author_ids=corpus.complements[start:start + count].tolist())
+                f.write(json.dumps(row) + '\n')
+                if position % 1000000 == 0:
+                    elapsed = time.monotonic() - started
+                    print(f'Exported {split}: {position:,}/{len(order):,} records '
+                          f'({position / elapsed:,.0f} records/s)', flush=True)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--clusters', default='papers/clusters_80.json')
+    p.add_argument('--db', default='data/llm-papers.db')
+    p.add_argument('--token-mapping', default='data/coherence_dataset/token_mapping.json')
+    p.add_argument('--output-dir', '--output', dest='output', default='data/availability_dataset_rebuilt')
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--split', type=float, default=0.9)
+    p.add_argument('--pool-cap', type=int, default=30)
+    p.add_argument('--per-author-budget', type=int, default=20000)
+    p.add_argument('--min-length', type=int, default=2)
+    p.add_argument('--max-length', type=int, default=4)
+    p.add_argument('--export-jsonl', action='store_true')
+    args = p.parse_args()
+    if not 2 <= args.min_length <= args.max_length <= 4:
+        p.error('compact query records support lengths 2 through 4')
+    if not 0 < args.split < 1 or args.pool_cap < 2 or args.per_author_budget < 1:
+        p.error('split must be between 0 and 1, pool cap >= 2, and budget positive')
+    build(args)
+
+
+if __name__ == '__main__':
     main()

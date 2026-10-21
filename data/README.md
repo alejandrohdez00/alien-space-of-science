@@ -1,14 +1,5 @@
-# `data/`
+# Data
 
-This directory is populated from the OSF artifacts and is ignored by git except for this note.
+Extract `data.tar.gz` in the repository root for the SQLite metadata and coherence dataset. Extract `availability-compact.tar.gz` for the availability training dataset. The default commands read these locations.
 
-Expected paths:
-
-| Path | Purpose |
-|---|---|
-| `data/llm-papers.db` | SQLite paper/author metadata for availability datasets. |
-| `data/vocab.json` | Token vocabulary used when rebuilding datasets from cluster metadata. |
-| `data/coherence_dataset/` | Released coherence train/validation JSONL files and `token_mapping.json`. |
-| `data/availability_dataset/` | Released two-tower availability train/validation JSONL files and `token_mapping.json`. |
-
-See `DATA.md` for schemas and contracts.
+See [DATA.md](../DATA.md) for counts, formats, optional JSONL downloads, and the relationship between author profiles and the inference bank. The main README contains the download and training commands.

@@ -57,8 +57,7 @@ def compute_vocab_partition(
     strictly after the cutoff are dropped from training and listed separately
     so post-cutoff evaluation can scope predictions honestly.
 
-    Papers missing venue_year metadata are treated as pre-cutoff (mirrors the
-    keep-on-missing semantics in build_author_super_atoms).
+    Papers missing venue_year metadata are treated as pre-cutoff.
     """
     pre: set[int] = set()
     all_clusters: set[int] = set()

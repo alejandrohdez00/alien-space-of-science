@@ -1,788 +1,333 @@
-"""Train the two-tower availability model.
+"""Train the dual encoder on the released compact subset/complement dataset.
 
-Uses a symmetric in-batch softmax loss to train an author-idea compatibility
-function s(a, T). The author tower encodes an
-author's atom repertoire; the set tower encodes a candidate atom set.
-
-Consumes precomputed pairs in the ``subset_complement_v1`` schema: each record
-carries a positive subset ``query_ids`` and the author's repertoire complement
-``author_ids`` (sample-level holdout baked in at dataset generation time).
-
-Usage:
-    python alien.py train-availability \
-        --train datasets/availability/availability_train.jsonl \
-        --val   datasets/availability/availability_val.jsonl \
-        --token-mapping datasets/availability/token_mapping.json \
-        --output-dir models/availability \
-        --epochs 30
+Single device: python alien.py train-availability --dataset data/availability_dataset
+Multiple GPUs: torchrun --standalone --nproc_per_node=4 -m generation.train_availability
 """
-
 import argparse
+import hashlib
 import json
 import math
 import os
-import sys
-from functools import partial
+import random
+import time
 from pathlib import Path
 
+import numpy as np
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
-import wandb
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from generation.two_tower_model import TwoTowerAvailabilityModel
-from generation.data import (
-    TwoTowerDataset,
-    two_tower_collate_fn,
-    load_token_mapping,
-)
+from generation.token_mapping import TokenMapping
+from generation.availability_data import Corpus, BatchDataset
+from generation.attention import zero_key_bias
 
 
-@torch.no_grad()
-def evaluate(model, dataloader, device):
-    """Compute loss, in-batch recall@1, and in-batch recall@5 on a dataset."""
-    model.eval()
-    total_loss = 0.0
-    total_correct_r1 = 0
-    total_correct_r5 = 0
-    total_samples = 0
-
-    for batch in dataloader:
-        author_ids = batch["author_input_ids"].to(device, non_blocking=True)
-        author_mask = batch["author_attention_mask"].to(device, non_blocking=True)
-        set_ids = batch["set_input_ids"].to(device, non_blocking=True)
-        set_mask = batch["set_attention_mask"].to(device, non_blocking=True)
-        aidx = batch["author_idx"].to(device, non_blocking=True)
-
-        B = author_ids.size(0)
-        same_author = aidx[:, None] == aidx[None, :]
-        same_author.fill_diagonal_(False)
-
-        logits = model(author_ids, author_mask, set_ids, set_mask)  # (B, B)
-        logits = logits.masked_fill(same_author, float("-inf"))
-
-        labels = torch.arange(B, dtype=torch.long, device=device)
-        loss_a2s = F.cross_entropy(logits, labels, reduction="sum")
-        loss_s2a = F.cross_entropy(logits.T, labels, reduction="sum")
-        loss = (loss_a2s + loss_s2a) / 2
-
-        total_loss += loss.item()
-
-        # Recall@1: for each author, is the correct set the top-scored?
-        preds = logits.argmax(dim=1)
-        total_correct_r1 += (preds == labels).sum().item()
-
-        # Recall@5
-        if B >= 5:
-            top5 = logits.topk(5, dim=1).indices
-            total_correct_r5 += (top5 == labels.unsqueeze(1)).any(dim=1).sum().item()
-        else:
-            total_correct_r5 += B  # trivially correct if batch < 5
-
-        total_samples += B
-
-    model.train()
-    avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-    recall_1 = total_correct_r1 / total_samples if total_samples > 0 else 0.0
-    recall_5 = total_correct_r5 / total_samples if total_samples > 0 else 0.0
-    return avg_loss, recall_1, recall_5
+def reduce_sum(value):
+    if dist.is_initialized():
+        dist.all_reduce(value)
 
 
-@torch.no_grad()
-def evaluate_full_pool_retrieval(
-    model,
-    val_dataset,
-    author_embeddings,
-    author_ids_list,
-    device,
-    batch_size=256,
-    indices=None,
-):
-    """Evaluate author retrieval against the full author pool.
+class Encoders(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
 
-    For each val sample, compute set embedding, dot with all author embeddings,
-    check if the correct author is in the top-k.
+    def forward(self, batch):
+        return (self.model.encode_authors(batch['author_input_ids'], batch['author_attention_mask']),
+                self.model.encode_sets(batch['set_input_ids'], batch['set_attention_mask']),
+                self.model.logit_scale)
 
-    Args:
-        indices: Optional sample indices to evaluate. If None, evaluates
-            all samples.
 
-    Returns:
-        Dict with recall@1, recall@5, recall@10, MRR
+def global_clip_loss(author, query, scale, author_idx):
+    """Local rows against ALL columns, with differentiable collective backward.
+
+    Collective backward sums contributions from every rank; DDP subsequently
+    averages parameter gradients. Together these give the global-batch mean.
     """
-    model.eval()
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if world > 1:
+        all_a = torch.cat(dist_nn.all_gather(author.contiguous()))
+        all_q = torch.cat(dist_nn.all_gather(query.contiguous()))
+        # NCCL requires contiguous collective inputs, including strided IDs.
+        author_idx = author_idx.contiguous()
+        ids = [torch.empty_like(author_idx) for _ in range(world)]
+        dist.all_gather(ids, author_idx)
+        all_ids = torch.cat(ids)
+    else:
+        all_a, all_q, all_ids = author, query, author_idx
+    labels = torch.arange(len(author), device=author.device) + rank * len(author)
+    mask = author_idx[:, None] == all_ids[None, :]
+    mask.scatter_(1, labels[:, None], False)
+    a_logits = (scale * (author @ all_q.T)).masked_fill(mask, -torch.inf)
+    q_logits = (scale * (query @ all_a.T)).masked_fill(mask, -torch.inf)
+    loss = (F.cross_entropy(a_logits, labels) + F.cross_entropy(q_logits, labels)) / 2
+    return loss, (a_logits.argmax(1) == labels).sum()
 
-    author_id_to_idx = {aid: i for i, aid in enumerate(author_ids_list)}
 
-    total = 0
-    correct_r1 = 0
-    correct_r5 = 0
-    correct_r10 = 0
-    rr_sum = 0.0
+def local_clip(model, batch):
+    logits = model(batch['author_input_ids'], batch['author_attention_mask'],
+                   batch['set_input_ids'], batch['set_attention_mask'])
+    same = batch['author_idx'][:, None] == batch['author_idx'][None, :]
+    same.fill_diagonal_(False)
+    logits = logits.masked_fill(same, -torch.inf)
+    labels = torch.arange(len(logits), device=logits.device)
+    return ((F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2,
+            (logits.argmax(1) == labels).sum())
 
-    eval_indices = indices if indices is not None else range(len(val_dataset))
 
-    for start in range(0, len(eval_indices), batch_size):
-        end = min(start + batch_size, len(eval_indices))
-        batch_items = [val_dataset[eval_indices[i]] for i in range(start, end)]
+def save_atomic(value, path):
+    path = Path(path)
+    temp = path.with_suffix(path.suffix + '.tmp')
+    torch.save(value, temp)
+    os.replace(temp, path)
 
-        # Only keep items whose author is in the training pool
-        valid_items = [
-            item for item in batch_items if item["author_id"] in author_id_to_idx
-        ]
-        if not valid_items:
+
+def rng_state():
+    return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state() if torch.cuda.is_available() else None)
+
+
+def restore_rng(state):
+    random.setstate(state['python']); np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    if state['cuda'] is not None:
+        torch.cuda.set_rng_state(state['cuda'])
+
+
+def to_device(batch, device):
+    return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+
+def loader(dataset, workers):
+    return DataLoader(dataset, batch_size=None, num_workers=workers, pin_memory=torch.cuda.is_available(),
+                      persistent_workers=workers > 0)
+
+
+@torch.no_grad()
+def author_bank(raw, corpus, device):
+    chunks = []
+    for start in range(0, len(corpus.training_authors), 512):
+        ids, mask = corpus.author_batch(corpus.training_authors[start:start + 512])
+        chunks.append(raw.encode_authors(ids.to(device), mask.to(device)))
+    return torch.cat(chunks)
+
+
+@torch.no_grad()
+def validate(raw, corpus, device, rank, world, global_batch, workers):
+    raw.eval()
+    batches = BatchDataset(corpus, corpus.val, global_batch)
+    positions = list(range(len(batches)))
+    selected = torch.utils.data.Subset(batches, positions[rank::world])
+    totals = torch.zeros(3, dtype=torch.float64, device=device)
+    for b in loader(selected, workers):
+        b = to_device(b, device)
+        # Original validation is fp32; retain it for checkpoint comparison.
+        loss, correct = local_clip(raw, b)
+        n = len(b['author_idx'])
+        totals += torch.stack([loss.double() * n, correct.double(), loss.new_tensor(n).double()])
+    reduce_sum(totals)
+    result = dict(loss=(totals[0] / totals[2]).item(), accuracy=(totals[1] / totals[2]).item())
+    bank = author_bank(raw, corpus, device)
+    lookup = torch.full((len(corpus.author_ids),), -1, dtype=torch.long, device=device)
+    lookup[torch.as_tensor(corpus.training_authors.astype(np.int64), device=device)] = torch.arange(len(bank), device=device)
+    indices = corpus.val
+    indices = indices[rank::world]
+    retrieval = torch.zeros(5, dtype=torch.float64, device=device)
+    for start in range(0, len(indices), 256):
+        b = to_device(corpus.batch(indices[start:start + 256]), device)
+        true = lookup[b['author_idx']]; valid = true >= 0
+        if not valid.any():
             continue
-
-        # Pad set atoms
-        set_seqs = [item["set_atoms"] for item in valid_items]
-        max_len = max(len(s) for s in set_seqs)
-        set_ids = torch.zeros(len(valid_items), max_len, dtype=torch.long, device=device)
-        set_mask = torch.zeros(len(valid_items), max_len, dtype=torch.long, device=device)
-        for i, seq in enumerate(set_seqs):
-            set_ids[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
-            set_mask[i, :len(seq)] = 1
-
-        set_embeds = model.encode_sets(set_ids, set_mask)  # (B, d)
-
-        # Score against all authors
-        scores = set_embeds @ author_embeddings.T  # (B, N_authors)
-
-        # Vectorized rank computation. "Rank under ties = best possible rank";
-        # for L2-normalized float embeddings ties are astronomically unlikely.
-        true_idx = torch.tensor(
-            [author_id_to_idx[item["author_id"]] for item in valid_items],
-            device=device, dtype=torch.long,
-        )
-        true_scores = scores.gather(1, true_idx.unsqueeze(1))  # (B, 1)
-        ranks = (scores > true_scores).sum(dim=1) + 1           # (B,)
-
-        correct_r1 += (ranks <= 1).sum().item()
-        correct_r5 += (ranks <= 5).sum().item()
-        correct_r10 += (ranks <= 10).sum().item()
-        rr_sum += (1.0 / ranks.float()).sum().item()
-        total += ranks.size(0)
-
-    model.train()
-
-    if total == 0:
-        return {"recall@1": 0, "recall@5": 0, "recall@10": 0, "mrr": 0}
-
-    return {
-        "recall@1": correct_r1 / total,
-        "recall@5": correct_r5 / total,
-        "recall@10": correct_r10 / total,
-        "mrr": rr_sum / total,
-    }
+        q = raw.encode_sets(b['set_input_ids'][valid], b['set_attention_mask'][valid])
+        scores = q @ bank.T
+        positive = scores.gather(1, true[valid, None])
+        ranks = (scores > positive).sum(1) + 1
+        retrieval += torch.stack([(1. / ranks.double()).sum(), (ranks <= 1).sum(),
+                                  (ranks <= 5).sum(), (ranks <= 10).sum(), valid.sum()])
+    reduce_sum(retrieval)
+    if retrieval[4] == 0:
+        raise ValueError('No validation authors in training bank')
+    result.update(mrr=(retrieval[0] / retrieval[4]).item(),
+                  recall1=(retrieval[1] / retrieval[4]).item(),
+                  recall5=(retrieval[2] / retrieval[4]).item(),
+                  recall10=(retrieval[3] / retrieval[4]).item())
+    if not all(math.isfinite(x) for x in result.values()):
+        raise FloatingPointError(result)
+    raw.train()
+    return result
 
 
-@torch.no_grad()
-def precompute_author_embeddings(model, dataset, device, batch_size=256):
-    """Pre-compute author embeddings for the full training pool.
-
-    In the author-centric regime there is no paper-level holdout, so the full
-    atom repertoire is always used; no ``include_val`` knob is needed.
-
-    Returns:
-        (author_embeddings tensor (N, d_model), list of author_ids)
-    """
-    model.eval()
-    author_atoms_dict = dataset.get_all_author_atoms()
-    author_ids_list = sorted(author_atoms_dict.keys())
-
-    all_embeds = []
-    for start in range(0, len(author_ids_list), batch_size):
-        end = min(start + batch_size, len(author_ids_list))
-        batch_aids = author_ids_list[start:end]
-        batch_atoms = [author_atoms_dict[aid] for aid in batch_aids]
-
-        max_len = max(len(a) for a in batch_atoms)
-        input_ids = torch.zeros(len(batch_atoms), max_len, dtype=torch.long, device=device)
-        mask = torch.zeros(len(batch_atoms), max_len, dtype=torch.long, device=device)
-        for i, atoms in enumerate(batch_atoms):
-            input_ids[i, :len(atoms)] = torch.tensor(atoms, dtype=torch.long)
-            mask[i, :len(atoms)] = 1
-
-        embeds = model.encode_authors(input_ids, mask)
-        all_embeds.append(embeds.cpu())
-
-    model.train()
-    return torch.cat(all_embeds, dim=0), author_ids_list
-
-
-@torch.no_grad()
-def evaluate_qualitative_retrieval(
-    model, author_embeddings, author_ids_list, author_profiles,
-    fixed_combos, device, top_k=5,
-):
-    """Evaluate author retrieval quality on fixed diagnostic combinations.
-
-    Returns dict with overlap_rate and mean_overlap metrics.
-    """
-    model.eval()
-    author_embeddings_dev = author_embeddings.to(device)
-
-    combos_tensor = torch.tensor(fixed_combos, dtype=torch.long, device=device)
-    mask = torch.ones_like(combos_tensor)
-    set_embeds = model.encode_sets(combos_tensor, mask)
-    scores = set_embeds @ author_embeddings_dev.T  # (N_combos, N_authors)
-
-    total_pairs = 0
-    pairs_with_overlap = 0
-    total_overlap = 0
-
-    for i, combo in enumerate(fixed_combos):
-        combo_set = set(combo)
-        topk_indices = scores[i].topk(top_k).indices.tolist()
-        for idx in topk_indices:
-            aid = author_ids_list[idx]
-            author_atoms = set(author_profiles.get(aid, []))
-            overlap = len(combo_set & author_atoms)
-            if overlap > 0:
-                pairs_with_overlap += 1
-            total_overlap += overlap
-            total_pairs += 1
-
-    model.train()
-    return {
-        "overlap_rate": pairs_with_overlap / total_pairs if total_pairs > 0 else 0,
-        "mean_overlap": total_overlap / total_pairs if total_pairs > 0 else 0,
-    }
-
-
-def train(
-    token_mapping_path: str,
-    output_dir: str,
-    train_path: str,
-    val_path: str,
-    run_name: str = None,
-    num_epochs: int = 15,
-    batch_size: int = 32,
-    learning_rate: float = 5e-4,
-    weight_decay: float = 0.01,
-    gradient_accumulation_steps: int = 4,
-    warmup_steps: int = 500,
-    d_model: int = 768,
-    num_layers: int = 6,
-    nhead: int = 12,
-    max_seq_len: int = 128,
-    max_logit_scale: float = 100.0,
-    author_dropout_prob: float = 0.0,
-    diagnostic_combos_path: str | None = None,
-    num_workers: int = 0,
-    compile_model: bool = False,
-):
-    """Train the two-tower availability model."""
-    # Load token mapping to get vocab size
-    token_mapping = load_token_mapping(token_mapping_path)
-    token_mapping, id_remap = token_mapping.compact()
-    vocab_size = token_mapping.compute_vocab_size()
-
-    sys.stderr.write(f"\n{'='*60}\n")
-    sys.stderr.write("Two-Tower Availability Training\n")
-    sys.stderr.write(f"{'='*60}\n")
-    sys.stderr.write(f"Train file: {train_path}\n")
-    sys.stderr.write(f"Val file: {val_path}\n")
-    sys.stderr.write(f"Token mapping: {token_mapping_path}\n")
-    sys.stderr.write(f"Output dir: {output_dir}\n")
-    sys.stderr.write(f"Vocab size: {vocab_size}\n")
-    sys.stderr.write(f"Max logit scale: {max_logit_scale}\n")
-    sys.stderr.write(f"Author dropout prob: {author_dropout_prob}\n")
-    if id_remap:
-        sys.stderr.write(f"ID remap: {id_remap}\n")
-    sys.stderr.write(f"{'='*60}\n\n")
-
-    # Load precomputed datasets. Train builds the full-repertoire map for
-    # retrieval diagnostics; val does not need it (retrieval scores val queries
-    # against the train author pool).
-    train_dataset = TwoTowerDataset(
-        train_path, id_remap=id_remap, build_author_atoms=True,
-    )
-    val_dataset = TwoTowerDataset(
-        val_path, id_remap=id_remap, build_author_atoms=False,
-    )
-
-    # Author-side dropout applies to train only (val stays at 0.0 default).
-    train_dataset.author_dropout_prob = author_dropout_prob
-
-    pad_token_id = token_mapping.eos_token_id
-    collate = partial(two_tower_collate_fn, pad_token_id=pad_token_id)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loader_kwargs = {
-        "num_workers": num_workers,
-        "pin_memory": device.type == "cuda",
-    }
-    if num_workers > 0:
-        loader_kwargs.update({
-            "persistent_workers": True,
-            "prefetch_factor": 4,
-        })
-
-    # Plain random-shuffle loader: in-batch same-author collisions are handled
-    # at the loss level via a (B, B) mask (see training loop).
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-        collate_fn=collate,
-        **loader_kwargs,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        collate_fn=collate,
-        **loader_kwargs,
-    )
-
-    # Create model
-    model = TwoTowerAvailabilityModel(
-        vocab_size=vocab_size,
-        d_model=d_model,
-        nhead=nhead,
-        num_layers=num_layers,
-        max_seq_len=max_seq_len,
-        max_logit_scale=max_logit_scale,
-    )
-    n_params = sum(p.numel() for p in model.parameters())
-    sys.stderr.write(f"Created model with {n_params:,} parameters\n")
-    sys.stderr.write(
-        f"  vocab_size={vocab_size}, d_model={d_model}, "
-        f"num_layers={num_layers}, nhead={nhead}\n"
-    )
-
-    if device.type == "cuda":
+def run(args):
+    cuda = args.device != "cpu" and torch.cuda.is_available()
+    if args.device == "cuda" and not cuda:
+        raise ValueError("CUDA was requested but is not available")
+    rank = int(os.environ.get("RANK", 0))
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    if cuda:
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+    device = torch.device("cuda", torch.cuda.current_device()) if cuda else torch.device("cpu")
+    if world > 1:
+        dist.init_process_group("nccl" if cuda else "gloo")
+    torch.set_num_threads(2)
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    if cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-    model.to(device)
-    sys.stderr.write(f"Model on device: {device}\n")
 
-    if compile_model:
-        sys.stderr.write("Compiling model with torch.compile()...\n")
-        model = torch.compile(model)
-
-    # Create output directory and save token mapping
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    with open(Path(output_dir) / "token_mapping.json", "w", encoding="utf-8") as f:
-        json.dump(token_mapping.raw, f, indent=2)
-
-    # Optimizer and scheduler; fused=True is CUDA-only.
+    corpus = Corpus(args.dataset)
+    if corpus.meta.get("kind") != "two_tower":
+        raise ValueError("Expected a compact two_tower availability dataset")
+    if args.batch_size % world or args.batch_size < world:
+        raise ValueError("Global batch size must be a positive multiple of the GPU count")
+    if len(corpus.train) < args.batch_size or not len(corpus.val):
+        raise ValueError("Need at least one full training batch and nonempty validation data; reduce --batch-size")
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    mapping, _ = TokenMapping(corpus.mapping).compact()
+    raw = TwoTowerAvailabilityModel(
+        vocab_size=mapping.compute_vocab_size(), d_model=args.d_model,
+        nhead=args.heads, num_layers=args.layers, dim_feedforward=args.ffn,
+        max_seq_len=128, dropout=args.dropout, max_logit_scale=30.0,
+    ).to(device)
+    zero_key_bias(raw)
+    encoders = Encoders(raw)
+    wrapped = torch.compile(encoders, dynamic=True) if args.compile else encoders
+    model = (DDP(wrapped, device_ids=[device.index] if cuda else None, broadcast_buffers=False)
+             if world > 1 else wrapped)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-        fused=(device.type == "cuda"),
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, fused=cuda,
     )
+    steps_per_epoch = len(corpus.train) // args.batch_size
+    total_steps = steps_per_epoch * args.epochs
 
-    total_steps = len(train_loader) * num_epochs // gradient_accumulation_steps
+    def schedule(step):
+        if step < args.warmup:
+            return step / max(args.warmup, 1)
+        return 0.5 * (1 + math.cos(math.pi * (step - args.warmup) / max(total_steps - args.warmup, 1)))
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+    signature = dict(
+        dataset_sha256=hashlib.sha256((corpus.path / "metadata.json").read_bytes()).hexdigest(),
+        model=raw.config, batch=args.batch_size, epochs=args.epochs, warmup=args.warmup,
+        learning_rate=args.learning_rate, weight_decay=args.weight_decay,
+        seed=args.seed, world=world, compile=args.compile, zero_key_bias=True,
+    )
+    checkpoint = out / "last.pt"
+    start_epoch, best, step = 1, -1.0, 0
+    if args.resume:
+        # Resume files are locally generated optimizer state, not inference weights.
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if state["signature"] != signature:
+            raise ValueError("Resume configuration/dataset differs from the saved run")
+        raw.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        start_epoch, best, step = state["epoch"] + 1, state["best"], state["step"]
+        restore_rng(state["rng"][rank])
+        zero_key_bias(raw)
+    else:
+        if checkpoint.exists() or (out / "model.pt").exists():
+            raise FileExistsError("Output already contains a run; use --resume or a new directory")
+        torch.manual_seed(args.seed + rank)
+        random.seed(args.seed + rank)
+        np.random.seed(args.seed + rank)
+    if rank == 0:
+        (out / "token_mapping.json").write_text(json.dumps(mapping.raw, indent=2))
+        (out / "run_config.json").write_text(json.dumps(signature, indent=2))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # bf16 autocast keeps fp32 dynamic range, so no gradient scaling is needed.
-
-    # wandb logging (optional)
-    use_wandb = os.environ.get("WANDB_PROJECT") is not None
-    if use_wandb:
-        wandb.init(
-            project=os.environ["WANDB_PROJECT"],
-            name=run_name,
-            config={
-                "model_type": "two_tower",
-                "vocab_size": vocab_size,
-                "d_model": d_model,
-                "num_layers": num_layers,
-                "nhead": nhead,
-                "max_seq_len": max_seq_len,
-                "batch_size": batch_size,
-                "learning_rate": learning_rate,
-                "weight_decay": weight_decay,
-                "gradient_accumulation_steps": gradient_accumulation_steps,
-                "warmup_steps": warmup_steps,
-                "num_epochs": num_epochs,
-                "max_logit_scale": max_logit_scale,
-                "author_dropout_prob": author_dropout_prob,
-                "compile": compile_model,
-            },
-        )
-
-    # Load diagnostic combinations for qualitative retrieval metric
-    diagnostic_combos = None
-    author_profiles_for_diag = None
-    if diagnostic_combos_path and Path(diagnostic_combos_path).exists():
-        with open(diagnostic_combos_path) as f:
-            diagnostic_combos = json.load(f)
-        # Build author profiles (full pre-augmentation atom sets) for overlap checking
-        author_profiles_for_diag = {
-            aid: sorted(atoms)
-            for aid, atoms in train_dataset.get_all_author_atoms().items()
-        }
-        sys.stderr.write(
-            f"Loaded {len(diagnostic_combos)} diagnostic combinations "
-            f"from {diagnostic_combos_path}\n"
-        )
-
-    # Training loop
-    sys.stderr.write("\nStarting training...\n")
-    best_pool_mrr = 0.0
-    global_step = 0
-    nan_skip_count = 0
-
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
+        started = time.monotonic()
+        order = np.random.default_rng(args.seed + epoch).permutation(len(corpus.train))
+        indices = corpus.train[order]
+        dataset = BatchDataset(corpus, indices, args.batch_size, rank, world, drop_last=True)
         model.train()
-        epoch_loss = 0.0
-        epoch_correct = 0
-        epoch_samples = 0
-        pending_grads = False
-
-        for batch_idx, batch in enumerate(train_loader):
-            author_ids = batch["author_input_ids"].to(device, non_blocking=True)
-            author_mask = batch["author_attention_mask"].to(device, non_blocking=True)
-            set_ids = batch["set_input_ids"].to(device, non_blocking=True)
-            set_mask = batch["set_attention_mask"].to(device, non_blocking=True)
-            aidx = batch["author_idx"].to(device, non_blocking=True)
-
-            B = author_ids.size(0)
-            # Same-author off-diagonal entries are legitimate positives. Mask
-            # them to -inf so they contribute weight 0 in the softmax; the mask
-            # is symmetric, so it covers both logits and logits.T.
-            same_author = aidx[:, None] == aidx[None, :]
-            same_author.fill_diagonal_(False)
-
-            with torch.amp.autocast(
-                "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
-            ):
-                logits = model(author_ids, author_mask, set_ids, set_mask)  # (B, B)
-                logits = logits.masked_fill(same_author, float("-inf"))
-
-                labels = torch.arange(B, dtype=torch.long, device=device)
-                loss_a2s = F.cross_entropy(logits, labels)
-                loss_s2a = F.cross_entropy(logits.T, labels)
-                loss = (loss_a2s + loss_s2a) / 2
-                loss = loss / gradient_accumulation_steps
-
-            # Loss-side NaN guard: without GradScaler's implicit skip, a NaN/Inf
-            # loss here would propagate through backward and corrupt weights on
-            # the next optimizer.step(). Drop the batch and continue.
-            if not torch.isfinite(loss):
-                optimizer.zero_grad(set_to_none=True)
-                pending_grads = False
-                nan_skip_count += 1
-                continue
-
-            loss.backward()
-            pending_grads = True
-
-            # Track metrics
-            epoch_loss += loss.item() * gradient_accumulation_steps * B
-            preds = logits.detach().argmax(dim=1)
-            epoch_correct += (preds == labels).sum().item()
-            epoch_samples += B
-
-            if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=1.0
-                )
-                # Gradient-side NaN guard: clip_grad_norm returns NaN if any
-                # per-param gradient contained NaN/Inf. Skip the step; the
-                # optimizer state stays clean and we don't corrupt weights.
-                if not torch.isfinite(grad_norm):
-                    optimizer.zero_grad(set_to_none=True)
-                    pending_grads = False
-                    nan_skip_count += 1
-                    continue
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
-                pending_grads = False
-                global_step += 1
-
-                if use_wandb and global_step % 100 == 0:
-                    raw_model = (
-                        model._orig_mod if hasattr(model, "_orig_mod") else model
-                    )
-                    wandb.log(
-                        {
-                            "train/loss": loss.item() * gradient_accumulation_steps,
-                            "train/lr": scheduler.get_last_lr()[0],
-                            "train/logit_scale": raw_model.logit_scale.item(),
-                            "train/grad_norm": grad_norm.item(),
-                            "train/nan_skips": nan_skip_count,
-                            "train/step": global_step,
-                        }
-                    )
-
-        # Handle leftover gradients only when the loop actually left some
-        # (gated on pending_grads to avoid a spurious no-op step).
-        if pending_grads:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=1.0
-            )
-            if torch.isfinite(grad_norm):
-                optimizer.step()
-                scheduler.step()
-                global_step += 1
-            else:
-                nan_skip_count += 1
+        totals = torch.zeros(2, dtype=torch.float64, device=device)
+        for bi, batch in enumerate(loader(dataset, args.workers)):
+            b = to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
-            pending_grads = False
-
-        avg_train_loss = (
-            epoch_loss / epoch_samples if epoch_samples > 0 else float("inf")
-        )
-        train_recall = epoch_correct / epoch_samples if epoch_samples > 0 else 0.0
-
-        # Validation: in-batch metrics
-        val_loss, val_r1, val_r5 = evaluate(model, val_loader, device)
-
-        raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-        logit_scale = raw_model.logit_scale.item()
-
-        sys.stderr.write(
-            f"Epoch {epoch}/{num_epochs} | "
-            f"Train loss: {avg_train_loss:.4f} | "
-            f"Train R@1: {train_recall:.4f} | "
-            f"Val loss: {val_loss:.4f} | "
-            f"Val R@1: {val_r1:.4f} | "
-            f"Val R@5: {val_r5:.4f} | "
-            f"Scale: {logit_scale:.2f} | "
-            f"LR: {scheduler.get_last_lr()[0]:.2e}"
-            + (f" | NaN skips: {nan_skip_count}" if nan_skip_count > 0 else "")
-            + "\n"
-        )
-
-        # Full-pool author retrieval (per-epoch diagnostic)
-        author_embeds, author_ids_list = precompute_author_embeddings(
-            raw_model, train_dataset, device
-        )
-        author_embeds_device = author_embeds.to(device)
-        retrieval = evaluate_full_pool_retrieval(
-            raw_model,
-            val_dataset,
-            author_embeds_device,
-            author_ids_list,
-            device,
-        )
-        sys.stderr.write(
-            f"  Full-pool retrieval: "
-            f"R@1={retrieval['recall@1']:.4f} "
-            f"R@5={retrieval['recall@5']:.4f} "
-            f"R@10={retrieval['recall@10']:.4f} "
-            f"MRR={retrieval['mrr']:.4f}\n"
-        )
-
-
-        # Qualitative retrieval diagnostic (every 10 epochs)
-        qual_retrieval = None
-        if diagnostic_combos is not None and epoch % 10 == 0:
-            qual_retrieval = evaluate_qualitative_retrieval(
-                raw_model, author_embeds, author_ids_list,
-                author_profiles_for_diag, diagnostic_combos, device,
-            )
-            sys.stderr.write(
-                f"  Qualitative retrieval: "
-                f"overlap_rate={qual_retrieval['overlap_rate']:.4f} "
-                f"mean_overlap={qual_retrieval['mean_overlap']:.4f}\n"
-            )
-
-        if use_wandb:
-            log_dict = {
-                "eval/loss": val_loss,
-                "eval/recall@1": val_r1,
-                "eval/recall@5": val_r5,
-                "eval/logit_scale": logit_scale,
-                "eval/pool_recall@1": retrieval["recall@1"],
-                "eval/pool_recall@5": retrieval["recall@5"],
-                "eval/pool_recall@10": retrieval["recall@10"],
-                "eval/pool_mrr": retrieval["mrr"],
-                "train/epoch_loss": avg_train_loss,
-                "train/epoch_recall@1": train_recall,
-                "epoch": epoch,
-            }
-            if qual_retrieval:
-                log_dict.update({
-                    "eval/retrieval_overlap_rate": qual_retrieval["overlap_rate"],
-                    "eval/retrieval_mean_overlap": qual_retrieval["mean_overlap"],
-                })
-            wandb.log(log_dict)
-
-        # Save best model by full-pool MRR, a ranking-quality metric.
-        pool_mrr = retrieval["mrr"]
-        if pool_mrr > best_pool_mrr:
-            best_pool_mrr = pool_mrr
-            raw_model.save(output_dir)
-            sys.stderr.write(f"  Saved best model (pool_mrr={pool_mrr:.4f})\n")
-
-    # Post-training: serialize author embeddings using full author repertoires
-    sys.stderr.write("\nSerializing author embeddings...\n")
-    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    # Reload best checkpoint for embedding serialization
-    raw_model = TwoTowerAvailabilityModel.load(output_dir, device=str(device))
-    author_embeds, author_ids_list = precompute_author_embeddings(
-        raw_model, train_dataset, device
-    )
-    torch.save(author_embeds, Path(output_dir) / "author_embeddings.pt")
-    with open(Path(output_dir) / "author_id_to_index.json", "w", encoding="utf-8") as f:
-        json.dump({aid: i for i, aid in enumerate(author_ids_list)}, f, indent=2)
-    sys.stderr.write(
-        f"  Saved {len(author_ids_list)} author embeddings to {output_dir}\n"
-    )
-
-    sys.stderr.write(f"\nTraining complete. Best pool MRR: {best_pool_mrr:.4f}\n")
-    sys.stderr.write(f"Model saved to {output_dir}\n")
-
-    if use_wandb:
-        wandb.finish()
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=cuda):
+                author, query, scale = model(b)
+                loss, _ = global_clip_loss(author, query, scale, b["author_idx"])
+            finite = torch.isfinite(loss).to(torch.int32)
+            if world > 1:
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if not finite.item():
+                raise FloatingPointError("Nonfinite loss; stopping before updating weights")
+            loss.backward()
+            zero_key_bias(raw, gradients=True)
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if not torch.isfinite(norm):
+                raise FloatingPointError("Nonfinite gradient")
+            optimizer.step()
+            zero_key_bias(raw)
+            scheduler.step()
+            step += 1
+            n = len(b["author_idx"])
+            totals += torch.stack([loss.detach().double() * n, loss.new_tensor(n).double()])
+            if rank == 0 and (bi + 1) % 500 == 0:
+                print(f"Epoch {epoch}: batch {bi + 1}/{steps_per_epoch}, loss {loss.item():.4f}", flush=True)
+        del dataset, indices, order
+        reduce_sum(totals)
+        metrics = validate(raw, corpus, device, rank, world, args.batch_size, args.workers)
+        if metrics["mrr"] > best:
+            best = metrics["mrr"]
+            if rank == 0:
+                raw.eval()
+                save_atomic(dict(config=raw.config, state_dict=raw.state_dict()), out / "model.pt")
+                save_atomic(author_bank(raw, corpus, device).cpu(), out / "author_embeddings.pt")
+                ids = [corpus.author_ids[int(i)] for i in corpus.training_authors]
+                (out / "author_id_to_index.json").write_text(json.dumps(dict(zip(ids, range(len(ids)))), indent=2))
+        states = [None] * world
+        if world > 1:
+            dist.all_gather_object(states, rng_state())
+        else:
+            states[0] = rng_state()
+        if rank == 0:
+            save_atomic(dict(signature=signature, model=raw.state_dict(), optimizer=optimizer.state_dict(),
+                             scheduler=scheduler.state_dict(), epoch=epoch, best=best, step=step, rng=states), checkpoint)
+            record = dict(epoch=epoch, train_loss=(totals[0] / totals[1]).item(),
+                          seconds=time.monotonic() - started, **metrics)
+            with (out / "metrics.jsonl").open("a") as f:
+                f.write(json.dumps(record) + "\n")
+            print(json.dumps(record), flush=True)
+    if rank == 0:
+        (out / "COMPLETE").write_text(json.dumps(dict(best_mrr=best, epochs=args.epochs, step=step)))
+        print(f"Saved selected model and matching author bank in {out}")
+    if world > 1:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train the two-tower availability model"
-    )
-
-    # Data arguments: precomputed subset_complement_v1 JSONLs
-    parser.add_argument(
-        "--train", type=str, required=True,
-        help="Pre-split training JSONL (subset_complement_v1 schema)",
-    )
-    parser.add_argument(
-        "--val", type=str, required=True,
-        help="Pre-split validation JSONL (subset_complement_v1 schema)",
-    )
-
-    # Required arguments
-    parser.add_argument(
-        "--token-mapping", type=str, required=True, help="Path to token_mapping.json"
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        required=True,
-        help="Output directory for model and checkpoints",
-    )
-    parser.add_argument(
-        "--run-name", type=str, default=None, help="Weights & Biases run name"
-    )
-
-    # Training hyperparameters
-    parser.add_argument(
-        "--epochs", type=int, default=15, help="Number of training epochs (default: 15)"
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=32, help="Batch size (default: 32)"
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=5e-4,
-        help="Learning rate (default: 5e-4)",
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=0.01,
-        help="Weight decay (default: 0.01)",
-    )
-    parser.add_argument(
-        "--gradient-accumulation-steps",
-        type=int,
-        default=4,
-        help="Gradient accumulation steps (default: 4)",
-    )
-    parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        default=500,
-        help="Number of warmup steps (default: 500)",
-    )
-
-    # Model architecture
-    parser.add_argument(
-        "--d-model", type=int, default=768, help="Embedding dimension (default: 768)"
-    )
-    parser.add_argument(
-        "--num-layers",
-        type=int,
-        default=6,
-        help="Number of transformer layers in set tower (default: 6)",
-    )
-    parser.add_argument(
-        "--nhead",
-        type=int,
-        default=12,
-        help="Number of attention heads (default: 12)",
-    )
-    parser.add_argument(
-        "--max-seq-len",
-        type=int,
-        default=128,
-        help="Maximum sequence length (default: 128)",
-    )
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        help="Compile model with torch.compile()",
-    )
-
-    # Two-tower specific
-    parser.add_argument(
-        "--max-logit-scale",
-        type=float,
-        default=100.0,
-        help="Maximum logit scale (1/temperature) clamp (default: 100.0)",
-    )
-    parser.add_argument(
-        "--author-dropout-prob",
-        type=float,
-        default=0.0,
-        help="Per-atom dropout on author-tower input (default: 0.0, off). "
-        "Opt-in regularization; no anti-leakage role under subset_complement_v1.",
-    )
-    parser.add_argument(
-        "--diagnostic-combos",
-        type=str,
-        default=None,
-        help="Path to JSON with fixed diagnostic combinations for retrieval metric",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="DataLoader workers (default: 0 for portability)",
-    )
-
-    args = parser.parse_args()
-
-    train(
-        train_path=args.train,
-        val_path=args.val,
-        token_mapping_path=args.token_mapping,
-        output_dir=args.output_dir,
-        run_name=args.run_name,
-        num_epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps,
-        d_model=args.d_model,
-        num_layers=args.num_layers,
-        nhead=args.nhead,
-        max_seq_len=args.max_seq_len,
-        max_logit_scale=args.max_logit_scale,
-        author_dropout_prob=args.author_dropout_prob,
-        diagnostic_combos_path=args.diagnostic_combos,
-        num_workers=args.num_workers,
-        compile_model=args.compile,
-    )
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--dataset", type=Path, default=Path("data/availability_dataset"))
+    p.add_argument("--output-dir", "--output", default="models/availability_model_retrained")
+    p.add_argument("--batch-size", type=int, default=4096, help="Global batch across all devices")
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--warmup", "--warmup-steps", type=int, default=2000)
+    p.add_argument("--learning-rate", type=float, default=5e-4)
+    p.add_argument("--weight-decay", type=float, default=0.03)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--layers", "--num-layers", type=int, default=6)
+    p.add_argument("--heads", "--nhead", type=int, default=8)
+    p.add_argument("--ffn", type=int, default=3072)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--resume", action="store_true")
+    args = p.parse_args()
+    if args.batch_size < 1 or args.epochs < 1 or args.warmup < 0:
+        p.error("batch size and epochs must be positive; warmup must be nonnegative")
+    run(args)
 
 
 if __name__ == "__main__":

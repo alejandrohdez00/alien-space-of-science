@@ -17,6 +17,11 @@ COMMANDS: dict[str, tuple[str, str, str]] = {
         "run_clustering",
         "Cluster refined ideas and name idea atoms.",
     ),
+    "reassign-noise": (
+        "atomization.reassign_noise",
+        "main",
+        "Reassign noise atoms to reach a target cluster coverage.",
+    ),
     "make-datasets": (
         "generation.make_datasets",
         "main",

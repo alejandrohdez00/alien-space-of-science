@@ -29,10 +29,12 @@ from generation.baselines import (
     llm_selection,
     cluster_ids_to_super_atoms,
 )
+from generation.baselines import selection
 from generation.reconstruct import (
     cache_key_for,
     get_sample_path,
     reconstruct_blog_from_super_atoms,
+    reconstruction_context,
 )
 from generation.utils.usage import set_log_path as set_usage_log_path
 
@@ -185,6 +187,10 @@ async def run_random_baseline(
     reconstruct_top_k: int | None = None,
 ) -> dict:
     """Run random subset baseline and return metadata."""
+    context = reconstruction_context(clusters_data, model_name)
+    output_dir = output_dir / context
+    cache_dir = cache_dir / context if cache_dir is not None else None
+
     all_cluster_ids = [int(cid) for cid in clusters_data["clusters"].keys()]
     print(f"Total clusters available: {len(all_cluster_ids)}")
     print(f"Processing {num_samples} samples with max {max_concurrent} concurrent API calls")
@@ -210,7 +216,7 @@ async def run_random_baseline(
         sample_seed = seed + i if seed is not None else None
         selected = random_subset_selection(all_cluster_ids, k=k, seed=sample_seed)
         super_atoms = cluster_ids_to_super_atoms(selected, clusters_data)
-        identifier = f"random_seed{sample_seed}"
+        identifier = f"random_seed{sample_seed}_{cache_key_for(selected)}"
 
         if not _should_reconstruct(i, reconstruct_top_k):
             print(f"[Sample {i+1}/{num_samples}] SELECTED ONLY")
@@ -314,6 +320,14 @@ async def run_llm_baseline(
     reconstruct_top_k: int | None = None,
 ) -> dict:
     """Run LLM selection baseline and return metadata."""
+    context = reconstruction_context(
+        clusters_data, model_name, selection_model=selection_model_name or selection.MODEL_NAME,
+        selection_prompt=selection.LLM_SELECTION_PROMPT,
+        k=k, max_name_length=selection_max_name_length,
+    )
+    output_dir = output_dir / context
+    cache_dir = cache_dir / context if cache_dir is not None else None
+
     all_cluster_ids = [int(cid) for cid in clusters_data["clusters"].keys()]
     print(f"Total clusters available: {len(all_cluster_ids)}")
     print(f"Processing {num_samples} samples with max {max_concurrent} concurrent API calls")
@@ -501,6 +515,10 @@ async def run_inference_reconstruction(
     reconstruct_top_k: int | None = None,
 ) -> dict:
     """Reconstruct from inference pipeline results and return metadata."""
+    context = reconstruction_context(clusters_data, model_name)
+    output_dir = output_dir / context
+    cache_dir = cache_dir / context if cache_dir is not None else None
+
     with open(results_path) as f:
         results = json.load(f)
 
@@ -539,7 +557,7 @@ async def run_inference_reconstruction(
     async def process_sequence(i: int, seq: dict) -> dict:
         cluster_ids = seq["cluster_ids"]
         super_atoms = cluster_ids_to_super_atoms(cluster_ids, clusters_data)
-        identifier = f"seq_{i}"
+        identifier = f"seq_{i}_{cache_key_for(cluster_ids)}"
         inference_scores = {
             "avg_nll_coherence": seq.get("avg_nll_coherence"),
             "avg_nll_availability": seq.get("avg_nll_availability"),
@@ -653,7 +671,7 @@ async def main():
     )
     parser.add_argument(
         "--clusters",
-        default="clusters.json",
+        default="papers/clusters_80.json",
         help="Path to clusters JSON file",
     )
     parser.add_argument(
@@ -731,10 +749,8 @@ async def main():
         default=None,
         help=(
             "LiteLLM model identifier for reconstruction. Defaults to "
-            "generation.reconstruct.MODEL_NAME. Pass a different value to swap the "
-            "reconstruction LLM without editing source. To compare two models "
-            "cleanly, set this together with a fresh --output-dir so the "
-            "per-sample blogs and the cache start empty."
+            "generation.reconstruct.MODEL_NAME. Decoder and prompt changes use "
+            "separate output and cache namespaces."
         ),
     )
     parser.add_argument(

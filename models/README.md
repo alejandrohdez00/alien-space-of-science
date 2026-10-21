@@ -1,17 +1,10 @@
-# `models/`
+# Models
 
-This directory is populated from the OSF model artifact or by local training. It is ignored by git except for this note.
+Download the Hugging Face model repository into this directory, as shown in the main README.
 
-Expected released checkpoints:
+- `coherence_model/`: `model.pt`, `token_mapping.json`.
+- `availability_model/`: `model.pt`, `token_mapping.json`, `author_embeddings.pt`, `author_id_to_index.json`, and training provenance.
 
-| Path | Contents |
-|---|---|
-| `models/coherence_model/` | Coherence Transformer checkpoint: `model.pt`, `token_mapping.json`. |
-| `models/availability_model/` | Two-tower availability checkpoint: `model.pt`, `author_embeddings.pt`, `author_id_to_index.json`, `token_mapping.json`. |
+Keep each model with its token mapping and the availability model with its author bank and ID-to-row mapping.
 
-Suggested local retraining outputs:
-
-| Path | Created by |
-|---|---|
-| `models/coherence_model_retrained/` | `python alien.py train-coherence ...` |
-| `models/availability_model_retrained/` | `python alien.py train-availability ...` |
+Retraining defaults to `availability_model_retrained/`. Use `model.pt` and the accompanying bank for inference; `last.pt` stores training resume state.

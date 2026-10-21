@@ -1,36 +1,10 @@
 #!/usr/bin/env python3
-"""Sample top-K atom-sets per beta from per-k shared candidate pools.
+"""Rank atom sets by coherence and unavailability using the released models.
 
-For each ``k in --ks`` (default ``[3, 4]``) and for each ``beta in [0.0, 0.1,
-..., 1.0]`` we re-rank a shared pool of length-k atom-sets by
-
-    fusion_score = (1 - beta) * z_coh + beta * z_avail   (beta in [0, 1])
-
-and emit a results JSON for the top-K sets. Each output JSON can be passed to
-``python alien.py reconstruct --method inference``.
-
-The pool is per-k (one for k=3, one for k=4); within a k it is shared across
-all betas so the only thing that changes per beta is the ranking. This makes
-beta values directly comparable within each k.
-
-Output layout:
-    <output-dir>/
-        k3/
-            pool_scores.json
-            beta_0.0/results.json
-            ...
-            beta_1.0/results.json
-            beta_sweep_summary.json
-        k4/
-            ...
-
-Usage:
-    python alien.py sample \\
-        --coherence-model    models/<coherence_run>/ \\
-        --availability-model models/<two_tower_run>/ \\
-        --token-mapping      datasets/<...>/token_mapping.json \\
-        --output-dir         results/beta_sweep/ \\
-        --ks 3 4 --n-gen 100000 --top-k 300
+By default, generate 1,000 candidate sequences for triplets and select the top
+300 at beta=0.7. Use --exhaustive-ks 3 to score all triplets, or --betas to rank
+the same candidate pool at several tradeoffs. Z-scores use the entire candidate
+pool before selecting top-k results. Outputs feed directly into reconstruction.
 """
 
 import argparse
@@ -107,7 +81,7 @@ def score_sets_coherence(
     token_mapping: TokenMapping,
     device: str,
     batch_size: int,
-    chunk_size: int = 100_000,
+    chunk_size: int = 2_000,
 ) -> np.ndarray:
     """Score unordered atom sets by mean coherence over all permutations."""
     if not sets:
@@ -204,21 +178,21 @@ def build_results_payload(
     fusion = (1.0 - beta) * z_coh + beta * z_avail
     # Order coherence and availability ranks (descending = best first), 1-indexed.
     rank_coh = np.empty_like(coh_scores, dtype=np.int64)
-    rank_coh[np.argsort(-coh_scores)] = np.arange(1, len(coh_scores) + 1)
+    rank_coh[np.argsort(-coh_scores, kind="stable")] = np.arange(1, len(coh_scores) + 1)
     rank_avail = np.empty_like(avail_scores, dtype=np.int64)
-    rank_avail[np.argsort(-avail_scores)] = np.arange(1, len(avail_scores) + 1)
+    rank_avail[np.argsort(-avail_scores, kind="stable")] = np.arange(1, len(avail_scores) + 1)
 
-    if top_k >= len(fusion):
-        top_idx = np.argsort(-fusion)
-    else:
-        top_idx = np.argpartition(-fusion, top_k)[:top_k]
-        top_idx = top_idx[np.argsort(-fusion[top_idx])]
+    # Candidate sets are canonical and sorted, so ties break by atom IDs.
+    top_idx = np.argsort(-fusion, kind="stable")[:top_k]
 
     sequences = []
     for rank_fused, i in enumerate(top_idx[:top_k], start=1):
         sequences.append({
             "cluster_ids": [int(c) for c in cand_sets[i]],
             "length": k,
+            "coherence": float(coh_scores[i]),
+            "availability": float(-avail_scores[i]),
+            "unavailability": float(avail_scores[i]),
             # NLL convention: avg_nll_coherence is mean per-token NLL under the
             # coherence model (low = coherent);
             # avg_nll_availability is the alien score under the availability
@@ -245,85 +219,19 @@ def build_results_payload(
     }
 
 
-def write_pool_scores(
-    output_dir: Path,
-    cand_sets: list[tuple[int, ...]],
-    coh_scores: np.ndarray,
-    avail_scores: np.ndarray,
-    z_coh: np.ndarray,
-    z_avail: np.ndarray,
-    config_extra: dict,
-    max_full_dump: int = 500_000,
-) -> None:
-    """Save the candidate pool with raw and z-scored scores.
-
-    For pools up to ``max_full_dump`` entries we emit ``pool_scores.json`` (the
-    full per-set list with raw + z-scores). For larger pools (e.g. exhaustive
-    enumeration of C(n, 3) ~ several million) we instead emit a compact
-    ``pool_summary.json`` with score-distribution stats only -- the full per-
-    set details would balloon the file to hundreds of MB while being trivially
-    re-derivable by re-running the (cheap) scoring.
-    """
-    if len(cand_sets) <= max_full_dump:
-        payload = {
-            "config": config_extra,
-            "n_candidates": len(cand_sets),
-            "candidates": [
-                {
-                    "cluster_ids": [int(c) for c in s],
-                    "coh_score": float(coh_scores[i]),
-                    "avail_score": float(avail_scores[i]),
-                    "z_coh": float(z_coh[i]),
-                    "z_avail": float(z_avail[i]),
-                }
-                for i, s in enumerate(cand_sets)
-            ],
-        }
-        path = output_dir / "pool_scores.json"
-        with open(path, "w") as f:
-            json.dump(payload, f)
-        sys.stderr.write(f"  Saved {path} ({len(cand_sets):,} candidates)\n")
-    else:
-        def _stats(x: np.ndarray) -> dict:
-            return {
-                "mean": float(x.mean()), "std": float(x.std()),
-                "min": float(x.min()), "max": float(x.max()),
-                "median": float(np.median(x)),
-                "p1": float(np.quantile(x, 0.01)),
-                "p99": float(np.quantile(x, 0.99)),
-            }
-        payload = {
-            "config": config_extra,
-            "n_candidates": len(cand_sets),
-            "note": (
-                f"Pool too large ({len(cand_sets):,} > {max_full_dump:,}) for full "
-                f"per-set dump; re-run sample_beta_sweep.py to recover full scores."
-            ),
-            "coh_score_stats": _stats(coh_scores),
-            "avail_score_stats": _stats(avail_scores),
-        }
-        path = output_dir / "pool_summary.json"
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
-        sys.stderr.write(
-            f"  Saved {path} (compact summary; full dump skipped for "
-            f"{len(cand_sets):,} candidates)\n"
-        )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate a shared candidate pool and emit per-beta top-K results JSONs.",
     )
-    parser.add_argument("--coherence-model", required=True, type=Path)
-    parser.add_argument("--availability-model", required=True, type=Path)
-    parser.add_argument("--token-mapping", required=True, type=Path)
+    parser.add_argument("--coherence-model", type=Path, default=Path("models/coherence_model"))
+    parser.add_argument("--availability-model", type=Path, default=Path("models/availability_model"))
+    parser.add_argument("--token-mapping", type=Path, help="Optional dataset mapping to check atom IDs against")
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("experiments/beta_sweep"),
+        "--output-dir", type=Path, default=Path("results/sample"),
     )
     parser.add_argument(
-        "--ks", type=int, nargs="+", default=[3, 4],
-        help="Atoms per set; produces one analysis per value (default: 3 4).",
+        "--ks", type=int, nargs="+", default=[3],
+        help="Atoms per set; produces one analysis per value (default: 3).",
     )
     parser.add_argument(
         "--exhaustive-ks", type=int, nargs="*", default=(),
@@ -335,27 +243,35 @@ def main() -> None:
             "ks not listed here use --n-gen sampled draws as before. Default: empty."
         ),
     )
-    parser.add_argument("--n-gen", type=int, default=100_000)
+    parser.add_argument("--n-gen", type=int, default=1000)
     parser.add_argument("--top-k", type=int, default=300, help="Top-K per beta (default: 300).")
     parser.add_argument(
-        "--betas", type=float, nargs="+", default=None,
-        help="Explicit beta values. Default: 0.0, 0.1, ..., 1.0.",
+        "--betas", type=float, nargs="+", default=[0.7],
+        help="Explicit beta values. Default: 0.7.",
     )
     parser.add_argument(
         "--gen-top-k", type=int, default=0,
         help=(
             "Per-step top-k truncation for the coherence-LM sampler "
             "(default: 0 = no truncation, sample from the full softmax "
-            "over all clusters at every step). The fusion ranking handles "
-            "candidate selection -- the pool is intentionally unbiased."
+            "over all clusters at every step). Candidates follow the coherence "
+            "model's distribution before fusion ranking."
         ),
     )
     parser.add_argument("--gen-temperature", type=float, default=1.0)
     parser.add_argument("--tt-top-k", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.top_k < 1 or args.n_gen < 1 or args.batch_size < 1 or args.tt_top_k < 1:
+        parser.error("top-k, n-gen, batch-size and tt-top-k must be positive")
+    if any(not np.isfinite(b) or not 0 <= b <= 1 for b in args.betas):
+        parser.error("betas must be finite numbers between 0 and 1")
+    if any(k < 2 or k > 4 for k in args.ks):
+        parser.error("supported atom-set sizes are 2, 3 and 4")
+    if args.gen_temperature <= 0:
+        parser.error("gen-temperature must be positive")
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -366,6 +282,13 @@ def main() -> None:
     else:
         device = args.device
     sys.stderr.write(f"Device: {device}\n")
+    for folder, filenames in [
+        (args.coherence_model, ["model.pt", "token_mapping.json"]),
+        (args.availability_model, ["model.pt", "token_mapping.json", "author_embeddings.pt", "author_id_to_index.json"]),
+    ]:
+        for filename in filenames:
+            if not (folder / filename).is_file():
+                parser.error(f"Missing {folder / filename}. Download the models as described in README.md, or set the model paths.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.betas is None:
@@ -391,35 +314,25 @@ def main() -> None:
     )
     author_embeddings = author_embeddings.to(device)
 
-    dataset_tm = TokenMapping.load(args.token_mapping)
     model_tm = coh_tm
-
-    if (
-        coh_tm.n_clusters != dataset_tm.n_clusters
-        or avail_tm.n_clusters != dataset_tm.n_clusters
-    ):
-        parser.error(
-            f"Cluster vocab mismatch: coherence={coh_tm.n_clusters}, "
-            f"availability={avail_tm.n_clusters}, dataset={dataset_tm.n_clusters}"
-        )
-    if (
-        coh_tm.bos_token_id != avail_tm.bos_token_id
-        or coh_tm.eos_token_id != avail_tm.eos_token_id
-    ):
-        parser.error(
-            f"Coherence and availability models use different special tokens: "
-            f"coh BOS/EOS = ({coh_tm.bos_token_id}, {coh_tm.eos_token_id}), "
-            f"avail BOS/EOS = ({avail_tm.bos_token_id}, {avail_tm.eos_token_id})."
-        )
+    atom_ids = sorted(int(c) for c in coh_tm.raw["cluster_to_token_id"])
+    if set(atom_ids) != {int(c) for c in avail_tm.raw["cluster_to_token_id"]}:
+        parser.error("Coherence and availability models must describe the same atom IDs")
+    if args.token_mapping:
+        dataset_tm = TokenMapping.load(args.token_mapping)
+        if set(atom_ids) != {int(c) for c in dataset_tm.raw["cluster_to_token_id"]}:
+            parser.error("Dataset and model atom IDs do not match")
+    if max(args.ks) > len(atom_ids):
+        parser.error("Requested more atoms per set than the vocabulary contains")
 
     verify_availability_permutation_invariance(
         avail_model,
         author_embeddings,
-        model_tm,
+        avail_tm,
         device=device,
         batch_size=args.batch_size,
         tt_top_k=args.tt_top_k,
-        sample_set=(0, 1, 2),
+        sample_set=tuple(atom_ids[:min(3, len(atom_ids))]),
     )
 
     exhaustive_ks = set(args.exhaustive_ks or ())
@@ -428,7 +341,7 @@ def main() -> None:
         "coherence_model": str(args.coherence_model),
         "availability_model": str(args.availability_model),
         "availability_model_type": "two_tower",
-        "token_mapping": str(args.token_mapping),
+        "token_mapping": str(args.token_mapping) if args.token_mapping else None,
         "n_gen": int(args.n_gen),
         "gen_top_k": int(args.gen_top_k),
         "gen_temperature": float(args.gen_temperature),
@@ -454,7 +367,7 @@ def main() -> None:
                 f"\n[exhaustive] Enumerating C({n}, {k}) = {n_combos:,} sets...\n"
             )
             t0 = time.time()
-            cand_sets = list(combinations(range(n), k))
+            cand_sets = list(combinations(atom_ids, k))
             sys.stderr.write(
                 f"  Built pool of {len(cand_sets):,} unique sets "
                 f"({time.time() - t0:.1f}s)\n"
@@ -486,7 +399,7 @@ def main() -> None:
         sys.stderr.write("Scoring availability (set-level, canonical order)...\n")
         t0 = time.time()
         avail_scores = score_sets_alien(
-            cand_sets, avail_model, model_tm,
+            cand_sets, avail_model, avail_tm,
             author_embeddings=author_embeddings,
             device=device,
             batch_size=args.batch_size,
@@ -503,15 +416,9 @@ def main() -> None:
             "n_candidate_sets": len(cand_sets),
         }
 
-        write_pool_scores(
-            k_output_dir,
-            cand_sets, coh_scores, avail_scores, z_coh, z_avail,
-            config_extra=config_extra,
-        )
-
         summary: list[dict] = []
         for beta in betas:
-            beta_dir = k_output_dir / f"beta_{beta:.1f}"
+            beta_dir = k_output_dir / f"beta_{beta:g}"
             beta_dir.mkdir(parents=True, exist_ok=True)
 
             payload = build_results_payload(
@@ -523,7 +430,7 @@ def main() -> None:
             with open(out_path, "w") as f:
                 json.dump(payload, f, indent=2)
             sys.stderr.write(
-                f"  beta={beta:.1f}: top-{args.top_k} -> {out_path}\n"
+                f"  beta={beta:g}: top-{args.top_k} -> {out_path}\n"
             )
             summary.append({
                 "beta": float(beta),

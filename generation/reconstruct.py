@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import time
 from pathlib import Path
 from typing import Iterable
@@ -35,6 +36,18 @@ def format_super_atoms(super_atoms: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def reconstruction_context(clusters_data: dict, model_name: str | None, **settings) -> str:
+    """Namespace caches by decoder, prompt, atom text and generation settings."""
+    payload = {
+        "model": model_name or MODEL_NAME,
+        "prompt": RECONSTRUCTION_PROMPT,
+        "atoms": clusters_data["clusters"],
+        "settings": settings,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
 def _log_reconstruction_backoff(details: dict) -> None:
     print(
         f"Retrying reconstruction API call in {details['wait']:.1f}s... "
@@ -49,6 +62,15 @@ def _log_reconstruction_backoff(details: dict) -> None:
     giveup=lambda e: not is_retryable_error(e),
     on_backoff=_log_reconstruction_backoff,
 )
+async def _complete_with_retry(prompt: str, model_name: str):
+    # Exceptions must reach the decorator; the public wrapper reports failure
+    # only after retries have been exhausted.
+    return await asyncio.to_thread(
+        completion, model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
 async def reconstruct_blog_from_super_atoms(
     paper_id: str,
     super_atoms: list[dict],
@@ -64,11 +86,7 @@ async def reconstruct_blog_from_super_atoms(
         super_atoms_text = format_super_atoms(super_atoms)
         prompt = RECONSTRUCTION_PROMPT.format(super_atoms_text=super_atoms_text)
 
-        response = await asyncio.to_thread(
-            completion,
-            model=effective_model,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        response = await _complete_with_retry(prompt, effective_model)
         log_call(
             stage="reconstruction",
             model=effective_model,
@@ -78,6 +96,8 @@ async def reconstruct_blog_from_super_atoms(
         )
 
         blog_content = response.choices[0].message.content
+        if not isinstance(blog_content, str) or not blog_content.strip():
+            raise ValueError("Decoder returned empty content")
 
         reconstruction_dir = output_dir / paper_id
         reconstruction_dir.mkdir(parents=True, exist_ok=True)

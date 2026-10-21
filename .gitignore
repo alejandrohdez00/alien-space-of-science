@@ -9,6 +9,7 @@ venv/
 
 # Local pipeline outputs
 papers/
+/downloads/
 data/*
 !data/
 !data/README.md
@@ -26,3 +27,6 @@ logs/
 # Local secrets and notebooks
 .env
 *.ipynb_checkpoints/
+
+# Local release preparation (source data may contain contact identifiers)
+/release/
