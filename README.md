@@ -2,7 +2,7 @@
 
 Code and data for **[The Alien Space of Science: Sampling Coherent but Cognitively Unavailable Research Directions](https://arxiv.org/abs/2603.01092)**.
 
-**This project was developed during an internship at [Tiptree Systems](https://tiptreesystems.com). An improved version is available as an MCP server through our [Lacuna MCP](https://github.com/tiptreesystems/lacuna-research-mcp)!**
+**This project was developed during my internship at [Tiptree Systems](https://tiptreesystems.com). A production version mapping 2m+ papers into 25k+ research hypotheses is available at [Lacuna](https://lacuna.tiptreesystems.com). You can also use our [Lacuna MCP](https://github.com/tiptreesystems/lacuna-research-mcp)!**
 
 Alien represents papers as idea atoms and ranks combinations using a coherence transformer and an author–atom dual encoder. An LLM can then turn selected combinations into research proposals.
 
